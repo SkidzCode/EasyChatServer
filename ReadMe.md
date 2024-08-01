@@ -69,8 +69,3 @@ This project is licensed under the Mozilla Public License 2.0. However, **commer
 ## Contact
 
 For more information, please feel free to reach out to me.
-```
-
-### Notes:
-- Ensure to replace `yourusername` with your actual GitHub username and add your email at the end for contact information.
-- You may want to provide additional details or links if you have specific contributions, references, or acknowledgments to mention.
