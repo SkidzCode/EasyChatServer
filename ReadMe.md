@@ -20,7 +20,7 @@ Welcome to **SimpleChatServer**! This is the simplest thread-safe chat server im
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/SimpleChatServer.git
+   git clone https://github.com/SkidzCode/EasyChatServer.git
    cd SimpleChatServer
    ```
 
