@@ -28,4 +28,8 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="EasyChatServer.Tests" />
+  </ItemGroup>
+
 </Project>

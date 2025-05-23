@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Microsoft.Extensions.Configuration;
+using System;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
@@ -11,37 +12,60 @@ namespace EasyChatServer
     public class Program
     {
         private static readonly ConcurrentDictionary<string, MyClient> clients = new();
-        private static TcpListener listener;
-        private static readonly CancellationTokenSource cancellationTokenSource = new();
+        internal static TcpListener listener;
+        internal static readonly CancellationTokenSource cancellationTokenSource = new();
 
         static async Task Main(string[] args)
         {
+            IConfigurationRoot configuration = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+                .Build();
+
             if (args.Length == 0)
             {
                 // Run as server
-                await RunServerAsync();
+                var serverRunTask = RunServerAsync(configuration);
+                Console.WriteLine("Press ENTER to stop the server...");
+                Console.ReadLine(); // This blocks the Main thread for normal execution
+                
+                await StopServerAsync(); // Gracefully stop the server
+                await serverRunTask; // Wait for server task to complete processing
+                Console.WriteLine("Server stopped.");
             }
             else
             {
                 // Run as client
-                await RunClientAsync(args[0]);
+                await RunClientAsync(args[0], configuration);
             }
         }
-
-        static async Task RunServerAsync()
+        
+        internal static async Task StopServerAsync()
         {
-            listener = new TcpListener(IPAddress.Any, 8888);
+            if (!cancellationTokenSource.IsCancellationRequested)
+            {
+                cancellationTokenSource.Cancel();
+            }
+            
+            // Check if listener exists and is active before trying to stop it
+            if (listener != null && listener.Server.IsBound) 
+            {
+                listener.Stop();
+            }
+            // Give some time for tasks to acknowledge cancellation if needed.
+            // Depending on AcceptClientsAsync and HandleClientAsync, further graceful shutdown logic might be added.
+            await Task.Delay(100); // Small delay to allow background tasks to notice cancellation.
+        }
+
+        static async Task RunServerAsync(IConfiguration configuration)
+        {
+            int port = configuration.GetSection("ServerConfig").GetValue<int>("Port", 8888);
+            listener = new TcpListener(IPAddress.Any, port);
             listener.Start();
-            Console.WriteLine("Server started on port 8888...");
-
-            Task acceptClientsTask = AcceptClientsAsync(cancellationTokenSource.Token);
-
-            Console.WriteLine("Press ENTER to stop the server...");
-            Console.ReadLine();
-
-            cancellationTokenSource.Cancel();
-            await acceptClientsTask;
-            listener.Stop();
+            Console.WriteLine($"Server started on port {port}...");
+            
+            // AcceptClientsAsync will now run until cancellationTokenSource is cancelled
+            await AcceptClientsAsync(cancellationTokenSource.Token);
         }
 
         private static async Task AcceptClientsAsync(CancellationToken cancellationToken)
@@ -64,37 +88,98 @@ namespace EasyChatServer
             }
         }
 
-        static async Task RunClientAsync(string serverAddress)
+        static async Task RunClientAsync(string serverAddress, IConfiguration configuration)
         {
+            TcpClient client = new TcpClient(); 
+            CancellationTokenSource clientActivityTokenSource = new CancellationTokenSource();
+
+            // Link the global token to the local one
+            cancellationTokenSource.Token.Register(() => clientActivityTokenSource.Cancel());
+
             try
             {
-                TcpClient client = new TcpClient();
-                await client.ConnectAsync(serverAddress, 8888);
+                int port = configuration.GetSection("ServerConfig").GetValue<int>("Port", 8888);
+                await client.ConnectAsync(serverAddress, port);
+                Console.WriteLine($"Connected to server at {serverAddress}:{port}. Type 'quit' to exit.");
 
                 using (var stream = client.GetStream())
                 using (var reader = new StreamReader(stream))
                 using (var writer = new StreamWriter(stream) { AutoFlush = true })
                 {
-                    _ = Task.Run(async () =>
+                    // Task for reading console input and sending messages
+                    var consoleInputTask = Task.Run(async () =>
                     {
-                        while (!cancellationTokenSource.Token.IsCancellationRequested)
+                        while (!clientActivityTokenSource.Token.IsCancellationRequested)
                         {
-                            Console.Write("Enter message: ");
-                            string message = Console.ReadLine();
-                            await writer.WriteLineAsync(message);
-                        }
-                    });
+                            Console.Write("Enter message: "); 
+                            string message = await Console.In.ReadLineAsync(); 
 
-                    while (!cancellationTokenSource.Token.IsCancellationRequested)
+                            if (string.IsNullOrEmpty(message)) continue;
+
+                            await writer.WriteLineAsync(message);
+                            if (message.ToLowerInvariant() == "quit")
+                            {
+                                clientActivityTokenSource.Cancel(); 
+                                break;
+                            }
+                        }
+                    }, clientActivityTokenSource.Token);
+
+                    // Task for receiving messages from the server
+                    var serverMessagesTask = Task.Run(async () =>
                     {
-                        string message = await reader.ReadLineAsync();
-                        Console.WriteLine(message);
-                    }
+                        try
+                        {
+                            while (!clientActivityTokenSource.Token.IsCancellationRequested)
+                            {
+                                string messageFromServer = await reader.ReadLineAsync(clientActivityTokenSource.Token); 
+                                if (messageFromServer == null) 
+                                {
+                                    Console.WriteLine("Server closed the connection.");
+                                    clientActivityTokenSource.Cancel();
+                                    break;
+                                }
+                                Console.WriteLine(messageFromServer);
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            Console.WriteLine("Disconnected from server (operation cancelled).");
+                        }
+                        catch (IOException ex)
+                        {
+                            Console.WriteLine($"Connection lost: {ex.Message}");
+                            clientActivityTokenSource.Cancel(); 
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error receiving message: {ex.Message}");
+                            clientActivityTokenSource.Cancel(); 
+                        }
+                    }, clientActivityTokenSource.Token);
+
+                    await Task.WhenAny(consoleInputTask, serverMessagesTask);
                 }
+            }
+            catch (SocketException ex) 
+            {
+                Console.WriteLine($"Could not connect to server: {ex.Message}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error connecting to server: {ex.Message}");
+                Console.WriteLine($"Client error: {ex.Message}");
+            }
+            finally
+            {
+                if (!clientActivityTokenSource.IsCancellationRequested)
+                {
+                    clientActivityTokenSource.Cancel(); 
+                }
+                if (client.Connected)
+                {
+                    client.Close(); 
+                }
+                Console.WriteLine("Client disconnected.");
             }
         }
 
@@ -121,11 +206,27 @@ namespace EasyChatServer
             }
             finally
             {
-                if (clients.TryRemove(clientId, out _))
+                string clientEndpointDescription = "Unknown";
+                try
                 {
-                    tcpClient.Close();
-                    Console.WriteLine($"Client {clientId} disconnected. Total clients: {clients.Count}");
+                    // Prefer using the RemoteEndPoint for a more user-friendly identifier in messages.
+                    clientEndpointDescription = tcpClient.Client.RemoteEndPoint?.ToString() ?? $"guid:{clientId}";
                 }
+                catch (ObjectDisposedException) // In case tcpClient was disposed elsewhere.
+                {
+                    clientEndpointDescription = $"guid:{clientId} (endpoint unavailable)";
+                }
+
+                if (clients.TryRemove(clientId, out MyClient removedClientContext)) 
+                {
+                    Console.WriteLine($"Client {clientEndpointDescription} disconnected. Total clients: {clients.Count}");
+                    BroadcastMessage($"Server: Client {clientEndpointDescription} has disconnected.");
+                    
+                    // Ensure the client's resources are cleaned up.
+                    removedClientContext.ClientCancelToken.Cancel(); // Proactively signal cancellation
+                    removedClientContext.TcpClient.Close(); // Close the actual connection
+                }
+                // If TryRemove fails (e.g. client was never fully added or already removed), there's nothing more to do here.
             }
         }
 
@@ -205,9 +306,10 @@ namespace EasyChatServer
                     {
                         await writer.WriteLineAsync(message);
                     }
-                    catch
+                    catch (Exception ex)
                     {
-
+                        Console.WriteLine($"Error sending message to client {TcpClient.Client.RemoteEndPoint}: {ex.Message}");
+                        // For now, just logging as requested. Client disconnection could be considered for future enhancements if certain errors are critical.
                     }
                 }
                 else
